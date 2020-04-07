@@ -1,0 +1,164 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Libraries
+```{r, message = F}
+library(haven)
+library(tidyverse)
+library(caret)
+library(LiblineaR)
+library(xgboost)
+library(plyr)
+library(e1071)
+library(RANN)
+library(kernlab)
+```
+
+
+# Data Import and Cleaning
+
+1. Read in data from SPSS format into a tibble using the read_sav function in the haven package
+2. Selected all variables beginning with "BIG5" along with the "HEALTH" variable to form a new (much smaller) tibble, "clean_data"
+3. Converted all variables in the reduced dataset to numeric
+4. Removed all rows that had an NA for the outcome variable ("HEALTH")
+5. Removed all rows with all NA's or all NA's except "HEALTH" missing
+
+```{r}
+full_data <- read_sav("../data/GSS2006.sav")
+clean_data <- full_data %>%
+  select_at(vars(c(starts_with("BIG5"), "HEALTH"))) %>%
+  mutate_all("as.numeric") %>%
+  drop_na("HEALTH") %>%
+  filter(rowSums(is.na(.[,1:10])) != 10)
+```
+
+
+# Analysis
+
+```{r}
+# Setting the seed to allow for reproducible randomness
+set.seed(123)
+
+# Creating random train and holdout samples
+rows <- sample(nrow(clean_data))
+shuffled_data <- clean_data[rows,]
+train <- shuffled_data[251:nrow(shuffled_data),]
+holdout <- shuffled_data[1:250,]
+
+# Creating a training method vector to do 10-fold cross-validation
+index <- createFolds(train$HEALTH, k = 10, returnTrain = T)
+my_control_train <- trainControl(method = "cv", number = 10, index = index, verboseIter = T)
+
+# Creating a pre-processing vector to use for all models that imputes missing
+# values using the knn technique, centers and scales the data, and removes
+# predictors with zero variance
+my_preProcess <- c("knnImpute","zv", "center", "scale")
+```
+
+Using the knn technique to handle missingness is appropriate given that less than 25% of the observations for each scale are missing, and the missinging is assumed to be random. 
+
+## OLS Model
+
+```{r}
+# Fitting the model
+ols_mod <- train(
+  HEALTH ~ . ^2, 
+  train,
+  method = "lm",
+  preProcess = my_preProcess,
+  na.action = na.pass,
+  trControl = my_control_train
+)
+
+# Summary of final model and holdout sample predictive accuracy
+summary(ols_mod)
+ols_predict <- predict(ols_mod, holdout, na.action=na.pass)
+cor(holdout$HEALTH, ols_predict)
+```
+
+The model has a holdout sample predictive accuracy of r = 0.117.
+
+## Elastic Net Model 
+
+```{r}
+# Fitting the model, tuneLength = 10 to choose optimal hyperparameters
+glmnet_mod <- train(
+  HEALTH ~ . ^2, 
+  train,
+  method = "glmnet",
+  preProcess = my_preProcess,
+  na.action = na.pass,
+  trControl = my_control_train,
+  tuneLength = 10
+)
+
+# Summary of final model and holdout sample predictive accuracy
+glmnet_mod
+glmnet_predict <- predict(glmnet_mod, holdout, na.action = na.pass)
+cor(holdout$HEALTH, glmnet_predict)
+```
+
+The model has a holdout sample predictive accuracy of r = 0.150.
+
+## Support Vector Model
+
+```{r}
+# Fitting the model, svr_eps = 0.1 as per default value in documentation
+svr_mod <- train(
+  HEALTH ~ . ^2, 
+  train,
+  method = "svmPoly",
+  preProcess = my_preProcess,
+  na.action = na.pass,
+  trControl = my_control_train,
+  tuneLength = 2
+)
+
+# Summary of final model and holdout sample predictive accuracy
+svr_mod
+svr_predict <- predict(svr_mod, holdout, na.action=na.pass)
+cor(holdout$HEALTH, svr_predict)
+```
+
+The model has a holdout sample predictive accuracy of r = 0.098.
+
+## Boosted Model
+
+```{r}
+# Fitting the model
+egb_mod <- train(
+  HEALTH ~ . ^2, 
+  train,
+  method = "xgbDART",
+  preProcess = my_preProcess,
+  na.action = na.pass,
+  trControl = my_control_train
+)
+
+# Summary of final model and holdout sample predictive accuracy
+egb_mod
+egb_predict <- predict(egb_mod, holdout, na.action=na.pass)
+cor(holdout$HEALTH, egb_predict)
+```
+
+The OLS model is very basic, and is not expected to perform well with a moderately large number (55, in this case) of predictors. This exaplins why the OLS model had a holdout sample predictive accuracy of only 0.117. The hyperparameters chosen for the elastic net model were alpha = 1, lambda = 0.0222. This means that the model was a LASSO model with a small to moderate penalty (0.032). This allows some predictors to drop out of the model entirely. The fact that large coefficients are penalized prevents overfitting, which could contribute to the elastic net model having a higher holdout sample predictive accuracy, at r = 0.15. The SVR technique can be useful when data is nonlinear or to prevent overfitting, and in this case resulted in a moderate holdout sample predictive accuracy of 0.135. Finally, the boosted model attempts to decrease bias in prediction by averaging across computationally simple models, which works well when you have a high bias model. This resulted in the highest holdout predictive accuracy of any of the four models, at r = 0.19 . 
+
+
+# Visualization
+```{r}
+summary(resamples(list("ols" = ols_mod, "elastic" = glmnet_mod, "vector" = svr_mod, "boosted" = egb_mod)))
+
+
+dotplot(resamples(list("ols" = ols_mod, "elastic" = glmnet_mod, "vector" = svr_mod, "boosted" = egb_mod)))
+dotplot(resamples(list("ols" = ols_mod, "elastic" = glmnet_mod, "vector" = svr_mod, "boosted" = egb_mod)), metric = "Rsquared")
+dotplot(resamples(list("ols" = ols_mod, "elastic" = glmnet_mod, "vector" = svr_mod, "boosted" = egb_mod)), metric = "RMSE")
+```
+
+The OLS model had the lowest  R^2, RMSE, and holdout sample predictive accuracy, making it the worst model. On the metric of R^2, the other three models were very comparable, with the SVR model being the highest at 0.0346 by a very small margin (less then 0.001). However, the SVR model also had slightly higher RMSE than either the EGB model or the LASSO model. The LASSO model had the lowest RMSE. Taking these metrics into account, along with the fact that the boosted model had the highest holdout sample predictive accuracy, I would prefer the extreme gradient boosted model in this scenario. The tradeoff to this is that the boosted model has the largest variance around its Rsquared value, indicating that there is a greater chance it could provide very poor fit to a new data set. Using SVR or elastic net, which had less variance in their Rsquared values, could reduce this chance. 
+
+
+
